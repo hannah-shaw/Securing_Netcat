@@ -7,6 +7,10 @@ import re
 import socket
 import sys
 import threading
+from Crypto.Cipher import AES
+from Crypto.Util import Counter
+from Crypto import Random
+from binascii import hexlify
 
 
 # -------------------------------------------------------------------------------------------------
@@ -60,6 +64,25 @@ def log(msg, level, verbose):
 
 
 # -------------------------------------------------------------------------------------------------
+# ENCRYPT DECRYPT FUNCTIONS
+# -------------------------------------------------------------------------------------------------
+#Apply padding
+def pad(s, bs=32):
+    return bytes(s + (16 - len(s) % 16) * chr(16 - len(s) % 16), 'utf-8')
+
+def unpad(s):
+        return s[0:-ord(s[-1:])]
+
+def my_encrypt_function(data,key):
+    data = pad(data)
+    cipher = AES.new(key,AES.MODE_ECB)
+    return cipher.encrypt(data)
+
+def my_decrypt_function(ctext,key):
+    cipher = AES.new(key,AES.MODE_ECB)
+    return unpad(cipher.decrypt(ctext))  
+
+# -------------------------------------------------------------------------------------------------
 # CLIENT/SERVER COMMUNICATOIN FUNCTIONS
 # -------------------------------------------------------------------------------------------------
 
@@ -79,25 +102,32 @@ def send(s, udp=False, crlf=False, verbose=0):
         # Read user input
         data = input()
 
-        # Ensure to terminate with desired newline
-        if isinstance(data, bytes):
-            data = b2str(data)
-        if crlf:
-            data += "\r\n"
-        else:
-            data += "\n"
+        #generate 128bits-16 bytes key
+        k = ("Network Security").encode('utf-8')
+        # Encrypt the data using an encryption algorithm
+        encrypted_data = my_encrypt_function(data,k)
+        print("send")
+        print(encrypted_data)
 
-        size = len(data)
-        data = data.encode()
+        # Ensure to terminate with desired newline
+        if isinstance(encrypted_data, bytes):
+            encrypted_data = b2str(encrypted_data)
+        if crlf:
+            encrypted_data += "\r\n"
+        else:
+            encrypted_data += "\n"
+
+        size = len(encrypted_data)
+        encrypted_data = encrypted_data.encode()
         send = 0
 
         # Loop until all bytes have been send
         while send < size:
             try:
                 if udp:
-                    send += s.sendto(data, (UDP_CLIENT_ADDR, UDP_CLIENT_PORT))
+                    send += s.sendto(encrypted_data, (UDP_CLIENT_ADDR, UDP_CLIENT_PORT))
                 else:
-                    send += s.send(data)
+                    send += s.send(encrypted_data)
             except (OSError, socket.error) as error:
                 print("[Send Error] %s" % (error), file=sys.stderr)
                 print(s, file=sys.stderr)
@@ -125,7 +155,16 @@ def receive(s, udp=False, bufsize=1024, verbose=0):
         while True:
             try:
                 (byte, addr) = s.recvfrom(bufsize)
-                data += b2str(byte)
+                #generate 128bits-16 bytes key
+                k = ("Network Security").encode('utf-8')
+                print("byte:")
+                print(byte)
+                # Decrypt the data using a decryption algorithm
+                decrypted_data = my_decrypt_function(byte,k)
+                print("decrypted_data")
+                print(decrypted_data)
+
+                data += b2str(decrypted_data)
 
                 # If we're receiving data from a UDP client
                 # we can finally set its addr/port in order
