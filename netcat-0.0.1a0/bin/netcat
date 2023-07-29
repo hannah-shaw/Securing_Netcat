@@ -8,9 +8,16 @@ import socket
 import sys
 import threading
 from Crypto.Cipher import AES
-from Crypto.Util import Counter
-from Crypto import Random
-from binascii import hexlify
+import select
+import socket
+import sys
+import argparse
+import base64
+from Crypto.Random import get_random_bytes
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import unpad
 
 
 # -------------------------------------------------------------------------------------------------
@@ -66,21 +73,25 @@ def log(msg, level, verbose):
 # -------------------------------------------------------------------------------------------------
 # ENCRYPT DECRYPT FUNCTIONS
 # -------------------------------------------------------------------------------------------------
-#Apply padding
-def pad(s, bs=32):
-    return bytes(s + (16 - len(s) % 16) * chr(16 - len(s) % 16), 'utf-8')
+def genKey(password,salt):
+        return PBKDF2(password, salt, dkLen=32, count=1000)
 
-def unpad(s):
-        return s[0:-ord(s[-1:])]
+def encryptData(password,data):
+    nonce = get_random_bytes(16)
+    salt = get_random_bytes(32)
+    cipher = AES.new(genKey(password, salt), AES.MODE_GCM, nonce=nonce)
+    ciphered_data, digest = cipher.encrypt_and_digest(data.encode('utf-8'))
+    return base64.b64encode(nonce + salt + ciphered_data + digest).decode('utf-8')
 
-def my_encrypt_function(data,key):
-    data = pad(data)
-    cipher = AES.new(key,AES.MODE_ECB)
-    return cipher.encrypt(data)
-
-def my_decrypt_function(ctext,key):
-    cipher = AES.new(key,AES.MODE_ECB)
-    return unpad(cipher.decrypt(ctext))  
+def decryptData(password,data):
+    data = base64.b64decode(data)
+    nonce = data[:16]
+    salt = data[16:48]
+    ciphered_data = data[48:-16]
+    digest = data[-16:]
+    cipher = AES.new(genKey(password, salt), AES.MODE_GCM, nonce=nonce)
+    original_data = cipher.decrypt_and_verify(ciphered_data, digest).decode('utf-8')
+    return original_data
 
 # -------------------------------------------------------------------------------------------------
 # CLIENT/SERVER COMMUNICATOIN FUNCTIONS
@@ -105,7 +116,8 @@ def send(s, udp=False, crlf=False, verbose=0):
         #generate 128bits-16 bytes key
         k = ("Network Security").encode('utf-8')
         # Encrypt the data using an encryption algorithm
-        encrypted_data = my_encrypt_function(data,k)
+        # encrypted_data = my_encrypt_function(data,k)
+        encrypted_data = encryptData(k,data)
         print("send")
         print(encrypted_data)
 
@@ -155,16 +167,14 @@ def receive(s, udp=False, bufsize=1024, verbose=0):
         while True:
             try:
                 (byte, addr) = s.recvfrom(bufsize)
-                #generate 128bits-16 bytes key
                 k = ("Network Security").encode('utf-8')
-                print("byte:")
-                print(byte)
                 # Decrypt the data using a decryption algorithm
-                decrypted_data = my_decrypt_function(byte,k)
+                # decrypted_data = my_decrypt_function(byte,k)
+                decrypted_data = decryptData(k,byte)
                 print("decrypted_data")
                 print(decrypted_data)
 
-                data += b2str(decrypted_data)
+                data += decrypted_data
 
                 # If we're receiving data from a UDP client
                 # we can finally set its addr/port in order
