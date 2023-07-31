@@ -18,26 +18,6 @@ import sys
 import binascii as ba
 from binascii import hexlify
 
-#import libraries
-from Crypto.Cipher import AES
-
-#Apply padding
-def pad(s, bs=32):
-    return bytes(s + (16 - len(s) % 16) * chr(16 - len(s) % 16), 'utf-8')
-
-def unpad(s):
-        return s[0:-ord(s[-1:])]
-    
-    
-def encryption(key, raw, mode):
-    data = pad(raw)
-    cipher = AES.new(key,mode)
-    return cipher.encrypt(data)
-
-def decryption(key, ctext,mode):
-    cipher = AES.new(key,mode)
-    return unpad(cipher.decrypt(ctext))
-
 def load_dh_params():
     '''
     Load DH parameters from a file which is hard coded here for simplicity
@@ -45,7 +25,7 @@ def load_dh_params():
     generated values in practice several defined primes and generators
     are hard-coded into programs
     '''
-    with open('./dh_128_params.bin', 'rb') as f:
+    with open('./dh_2048_params.bin', 'rb') as f:
         # the load_pem_parameters is part of serialization which reads binary 
         # input and converts it to proper objects in this case it is
         # DH parameters
@@ -174,37 +154,12 @@ class Dh_Handler(socketserver.BaseRequestHandler):
                 # we print the shared secret on the server and return
                 print('Shared Secret:\n{}'.format(ba.hexlify(shared_secret)))
 
-                plaintext = "Monash_FIT5032_Suzhou_HanXiao"*5
-
-                print("Plaintext:")
-                print(plaintext)
-
-                ciphertext= encryption(shared_secret,plaintext,AES.MODE_ECB)
-
-                print("Ciphertext:")
-                print(ciphertext)
-
-                content= decryption(shared_secret,ciphertext,AES.MODE_ECB)
-                print("Content after decryption")
-                print(content)
-                
-                response = ciphertext
-                self.request.sendall(response)
-
                 return
             else:
                 # if we get here the client key is not right
                 response = b'Invalid client public key, hanging up'
                 self.request.sendall(response)
                 return  
-def handle_input(sock):
-    while True:
-        # 从终端读取用户输入
-        message = input("Enter message: ")
-        # 将消息编码为 bytes 对象
-        message_bytes = message.encode('utf-8')
-        # 发送消息到服务器端
-        sock.sendall(message_bytes)
 
 def main():
     # choosing to listen on any address and port 7777

@@ -4,29 +4,9 @@ from cryptography.hazmat.primitives.asymmetric import dh
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import *
 
-import socketserver
 import socket
 from binascii import hexlify
 import binascii as ba
-from Crypto.Cipher import AES
-
-#Apply padding
-def pad(s, bs=32):
-    return bytes(s + (16 - len(s) % 16) * chr(16 - len(s) % 16), 'utf-8')
-
-def unpad(s):
-        return s[0:-ord(s[-1:])]
-    
-    
-def encryption(key, raw, mode):
-    data = pad(raw)
-    cipher = AES.new(key,mode)
-    return cipher.encrypt(data)
-
-def decryption(key, ctext,mode):
-    cipher = AES.new(key,mode)
-    return unpad(cipher.decrypt(ctext))
-
 def main():
     # we specify the server's address or hostname and port
     host, port = 'localhost', 7777
@@ -83,13 +63,6 @@ def main():
             shared_secret = client_keypair.exchange(server_pubkey)
             # print the shared secret
             print('Shared Secret\n{}'.format(ba.hexlify(shared_secret)))
-    
-            received = sock.recv(3072).strip()
-            print('Received:\n{}'.format(received))
-            content= decryption(shared_secret,received,AES.MODE_ECB)
-            print("Content after decryption")
-            print(content)
-
             # close the connection
             sock.close()
             return
