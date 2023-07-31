@@ -18,6 +18,15 @@ from Crypto.Protocol.KDF import PBKDF2
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from Crypto.Util.Padding import unpad
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.serialization import *
+import socketserver
+import sys
+import binascii as ba
+
+BUFF_SIZE=4096
 
 
 # -------------------------------------------------------------------------------------------------
@@ -98,7 +107,7 @@ def decryptData(password,data):
 # -------------------------------------------------------------------------------------------------
 
 
-def send(s, udp=False, crlf=False, verbose=0):
+def send(s, shared_secret, udp=False, crlf=False, verbose=0):
     """Send one newline terminated line to a connected socket."""
     # In case of sending data back to an udp client we need to wait
     # until the client has first connected and told us its addr/port
@@ -107,16 +116,12 @@ def send(s, udp=False, crlf=False, verbose=0):
             pass
         if verbose > 0:
             print("Client:     %s:%i" % (UDP_CLIENT_ADDR, UDP_CLIENT_PORT), file=sys.stderr)
-
     # Loop for the thread
     while True:
         # Read user input
         data = input()
 
-        #generate 128bits-16 bytes key
-        k = ("Network Security").encode('utf-8')
-        encrypted_data = encryptData(k,data)
-        print("sending encrypted_data")
+        encrypted_data = encryptData(shared_secret,data)
         print(encrypted_data)
 
         # Ensure to terminate with desired newline
@@ -149,14 +154,13 @@ def send(s, udp=False, crlf=False, verbose=0):
     s.close()
 
 
-def receive(s, udp=False, bufsize=1024, verbose=0):
+def receive(s, shared_secret, udp=False, bufsize=1024, verbose=0):
     """Read one newline terminated line from a connected socket."""
     global UDP_CLIENT_ADDR
     global UDP_CLIENT_PORT
 
     if verbose > 0:
         print("Receiving:  bufsize=%i" % (bufsize), file=sys.stderr)
-
     # Loop for the thread
     while True:
         data = ""
@@ -165,12 +169,7 @@ def receive(s, udp=False, bufsize=1024, verbose=0):
         while True:
             try:
                 (byte, addr) = s.recvfrom(bufsize)
-                k = ("Network Security").encode('utf-8')
-                decrypted_data = decryptData(k,byte)
-                print("decrypted_data")
-                print(decrypted_data)
-
-                data += decrypted_data
+                data += b2str(byte)
 
                 # If we're receiving data from a UDP client
                 # we can finally set its addr/port in order
@@ -202,7 +201,8 @@ def receive(s, udp=False, bufsize=1024, verbose=0):
         data = data.rstrip("\n")
         if verbose > 0:
             print("< ", end="", flush=True, file=sys.stderr)
-        print(data)
+        decrypted_data = decryptData(shared_secret,data)
+        print(decrypted_data)
 
     # Close connection when thread stops
     s.close()
@@ -314,11 +314,183 @@ def connect(s, addr, port, verbose=0):
 
 
 # -------------------------------------------------------------------------------------------------
+# SHARED SECRET
+# -------------------------------------------------------------------------------------------------
+def client_get_shared_secret(sock):
+    # set the first request according to our protocol
+    request = b'Hello'
+    # send the request
+    sock.sendall(request)
+    # read the server's response
+    received = sock.recv(3072).strip()
+    # print what we have received from the server
+    # print('Received:\n{}'.format(received))
+    # check if the response is valid according to our protocol
+    if received == b'Hey there!':
+        # set the next request accordingly
+        request = b'Params?'
+        sock.sendall(request)
+    else:
+        # if we get here something is not right
+        print('Bad response')
+        # close the connection and return
+        sock.close()
+        return None
+    # this means we are still in the game and the next server response must be the DH parameters
+    received = sock.recv(3072).strip()
+    # print('Received:\n{}'.format(received))
+    dh_params = load_pem_parameters(received, default_backend())
+    # check if the params are valid DH params (do we get here if the response was not valid or
+    # do we get an error before getting here?)
+    if isinstance(dh_params, dh.DHParameters):
+        # based on received parameters we generate a key pair
+        client_keypair = dh_params.generate_private_key()
+        # create the next message according to the protocol, get the binary of the public key
+        # to send to the server
+        request = b'Client public key:' + client_keypair.public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+        sock.sendall(request)
+    else:
+        print('Bad response')
+        sock.close()
+        return None
+    # this means we are still in the game
+    received = sock.recv(3072).strip()
+    # print('Received:\n{}'.format(received))
+    # check the format of the message (or rather the beginning)
+    if bytearray(received)[0:18] == b'Server public key:':
+        # get the server's public key from the binary and its proper index to the end
+        server_pubkey = load_pem_public_key(bytes(bytearray(received)[18:]), default_backend())
+        if isinstance(server_pubkey, dh.DHPublicKey):
+            # calculate the shared secret
+            shared_secret = client_keypair.exchange(server_pubkey)
+            # print the shared secret
+            # print('Shared Secret\n{}'.format(ba.hexlify(shared_secret))) # close the connection
+            return shared_secret
+
+    # if we get here it means something went wrong
+    print('Failed')
+    sock.close()
+    return None
+
+def load_dh_params():
+    '''
+    Load DH parameters from a file which is hard coded here for simplicity
+    generating DH parameters is a time consuming operation so we rather use 
+    generated values in practice several defined primes and generators
+    are hard-coded into programs
+    '''
+    with open('./dh_2048_params.bin', 'rb') as f:
+        # the load_pem_parameters is part of serialization which reads binary 
+        # input and converts it to proper objects in this case it is
+        # DH parameters
+        params = load_pem_parameters(f.read(), default_backend())
+    print('Parameters have been read from file, Server is ready for requests ...')
+    return params
+
+def generate_dh_prvkey(params):
+    '''
+    Generate a random private key (and a public key) from DH parameters
+    '''
+    return params.generate_private_key()
+    
+def check_client_pubkey(pubkey):
+    '''
+    Check whether the client public key is a valid instance of DH
+    shouldn't we check whether the key is valid under the parameters
+    sent by the server?
+    '''
+    if isinstance(pubkey, dh.DHPublicKey):
+        return True
+    else:
+        return False
+
+def  Dh_Handler(socket):
+        '''
+        This function handles the requests and sends proper responses
+        '''
+        # we read the first message sent by the client up to 3072 bytes
+        # what if the message is longer?
+        # should we check the size of the message?
+        data = socket.recv(3072).strip()
+        params = load_dh_params()
+
+        # here we are inventing our own protocol so say the first message sent by the client
+        # must be the text Hello, this message will only be valid if we are in state 0, ready 
+        # and just received the first request       
+        if data == b'Hello':
+            # print(data)
+            # now let's say the proper response in our protocol to the client's Hello message
+            # is the text message Hey There!
+            response = b'Hey there!'
+            # here we send this out to the client
+            socket.sendall(response)
+        else:
+            # we have received an invalid message since we can only expect a text Hello
+            # in state 0, anything else is invalid and we end the communication and return
+            response = b'I do not understand you, hanging up'
+            socket.sendall(response)
+            return
+        
+        # so far so good, if we get here it means we have received a proper Hello
+        # and have sent a proper Hey There!
+        # now is time to read the next client request   
+        data = socket.recv(3072).strip()
+        # we define the request be the text Params? and if we are in initiated state
+        if data == b'Params?':
+            # print(data)
+            dh_params = params
+            # here we convert the parameter object to binary so we could send it over the network
+            response = dh_params.parameter_bytes(Encoding.PEM, ParameterFormat.PKCS3)
+            socket.sendall(response)
+        else:
+            # if we get here then something was not right so we end the communication and return
+            response = b'I do not understand you, hanging up'
+            socket.sendall(response)
+            return
+
+        # Ok we have come a long way, time to read the next client message
+        data = socket.recv(3072).strip()
+        # now in our protocol we define that when the client wants to send the public key
+        # it would start the message with the text "Client public key:", we check if the message
+        # starts with that. We convert the received binary data to bytearray and take the first
+        # 18-byte slice of it which must be our expected text. Of-course we must be in state 2 
+        # (although we will not get here otherwise or would we?)
+        if bytearray(data)[0:18] == b'Client public key:':
+            # now we convert the binary message to bytearray so we can choose the public key 
+            # part of it and use key serialization method to turn it into an object
+            client_pubkey = load_pem_public_key(bytes(bytearray(data)[18:]), default_backend())
+            # now if the public key is loaded (we might not get to this point otherwise, 
+            # something for you to check!)
+            if client_pubkey:
+                # client key is valid so we generate our own from the parameters
+                server_keypair = generate_dh_prvkey(params)
+
+                # we will send the public key to the client and we need to convert it to 
+                # binary to send over the network
+                response = b'Server public key:' + server_keypair.public_key().public_bytes(
+                    Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+
+                # then we will calculate the shared secret
+                shared_secret = server_keypair.exchange(client_pubkey)
+                
+                # print(data)
+                socket.sendall(response)
+                # we print the shared secret on the server and return
+                # print('Shared Secret\n{}'.format(ba.hexlify(shared_secret)))
+                return (shared_secret)
+            else:
+                # if we get here the client key is not right
+                response = b'Invalid client public key, hanging up'
+                socket.sendall(response)
+                return 
+
+# -------------------------------------------------------------------------------------------------
 # CLIENT
 # -------------------------------------------------------------------------------------------------
 
 
-def run_client(host, port, udp=False, bufsize=1024, crlf=False, verbose=0):
+def run_client(host, port, udp=False,bufsize=1024, crlf=False, verbose=0):
     """Connect to host:port and send data."""
     global UDP_CLIENT_ADDR
     global UDP_CLIENT_PORT
@@ -335,13 +507,15 @@ def run_client(host, port, udp=False, bufsize=1024, crlf=False, verbose=0):
         UDP_CLIENT_PORT = port
     else:
         connect(s, addr, port, verbose=verbose)
+    
+    shared_secret = client_get_shared_secret(s)
 
     # Start sending and receiving threads
     tr = threading.Thread(
-        target=receive, args=(s,), kwargs={"udp": udp, "bufsize": bufsize, "verbose": verbose}
+        target=receive, args=(s,shared_secret), kwargs={"udp": udp, "bufsize": bufsize, "verbose": verbose}
     )
     ts = threading.Thread(
-        target=send, args=(s,), kwargs={"udp": udp, "crlf": crlf, "verbose": verbose}
+        target=send, args=(s,shared_secret), kwargs={"udp": udp, "crlf": crlf, "verbose": verbose}
     )
     # If the main thread kills, this thread will be killed too.
     tr.daemon = True
@@ -358,7 +532,6 @@ def run_client(host, port, udp=False, bufsize=1024, crlf=False, verbose=0):
         if not ts.is_alive():
             s.close()
             sys.exit(0)
-
 
 # -------------------------------------------------------------------------------------------------
 # SERVER
@@ -377,12 +550,14 @@ def run_server(host, port, udp=False, backlog=1, bufsize=1024, crlf=False, verbo
     else:
         c = s
 
+    shared_secret = Dh_Handler(c)
+
     # start sending and receiving threads
     tr = threading.Thread(
-        target=receive, args=(c,), kwargs={"udp": udp, "bufsize": bufsize, "verbose": verbose}
+        target=receive, args=(c,shared_secret), kwargs={"udp": udp, "bufsize": bufsize, "verbose": verbose}
     )
     ts = threading.Thread(
-        target=send, args=(c,), kwargs={"udp": udp, "crlf": crlf, "verbose": verbose}
+        target=send, args=(c,shared_secret), kwargs={"udp": udp, "crlf": crlf, "verbose": verbose}
     )
     # if the main thread kills, this thread will be killed too.
     tr.daemon = True
@@ -402,11 +577,129 @@ def run_server(host, port, udp=False, backlog=1, bufsize=1024, crlf=False, verbo
             s.close()
             sys.exit(0)
 
+# -------------------------------------------------------------------------------------------------
+# TRANSFER FILE FUNCTIONS
+# -------------------------------------------------------------------------------------------------
+
+class FileServer():
+
+    def __init__(self, ip='localhost', port=8080, isServerFlag=False):
+        self.Socket=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.Socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.clientSocket=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.clientSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.address=(str(ip), int(port))
+        self.isServerFlag=isServerFlag
+        if self.isServerFlag:
+            try:
+                self.Socket.bind(self.address)
+                print("Starting up socket on %s:%s" % self.address, file=sys.stderr)
+                self.Socket.listen(1)
+                self.conn,self.addr=self.Socket.accept()
+                self.conn.settimeout(3)
+                shared_secret = Dh_Handler(self.conn)
+
+            except KeyboardInterrupt:
+                print("Quitting process due to keyboard interrupt.", file=sys.stderr)
+                sys.exit(0)
+            except socket.error:
+                print("Socket error. Please try again later.", file=sys.stderr)
+                sys.exit(0)
+        else:
+            try:
+                self.clientSocket.connect(self.address)
+                shared_secret = client_get_shared_secret(self.clientSocket)
+            except ConnectionRefusedError:
+                print("Connection failure to server (%s,%s)" %self.address, file=sys.stderr)
+                sys.exit(0)
+            except socket.error:
+                print("Socket error. Please try again later.", file=sys.stderr)
+                sys.exit(0)
+            else:
+                print("Starting up and connected to %s:%s" % self.address, file=sys.stderr)
+            self.clientSocket.settimeout(5)
+        self.password= shared_secret
+        self.recieveList=[]
+        self.inputList=[]
+
+
+    def serverMode(self):
+        try:
+            try:
+                data = self.conn.recv(BUFF_SIZE).decode().strip()
+                while data:
+                    self.recieveList.append(data)
+                    data=self.conn.recv(BUFF_SIZE).decode().strip()
+            except socket.timeout:
+                if (select.select([sys.stdin], [], [], 0.0)[0]):
+                    data = sys.stdin.readline()
+                    while data:
+                        ciphertext = encryptData(self.password,data)
+                        self.conn.send(ciphertext.encode())
+                        data = sys.stdin.readline()
+                else:
+                    self.conn.close()
+                    self.Socket.close()
+
+            if len(self.recieveList)!=0:
+                print("Processing the received data.", file=sys.stderr)
+                try:
+                    for i in self.recieveList:
+                        if i:
+                            plaintext = decryptData(self.password,i)
+                            print(plaintext, file=sys.stdout, end='')
+                        else:
+                            pass
+                except:
+                    print("An error in decryption or MAC verification / decryption has occurred",file=sys.stderr)
+                print("Process complete.",file=sys.stderr)
+        except socket.error:
+            print("Closing connection due to termination on remote side.", file=sys.stderr)
+            sys.exit(0)
+        except KeyboardInterrupt:
+            print("Quitting process due to keyboard interrupt.", file=sys.stderr)
+            sys.exit(0)
+
+    def clientMode(self):
+        try:
+            if (select.select([sys.stdin], [], [], 0.0)[0]):
+                data=sys.stdin.readline()
+                while data:
+                    ciphertext=encryptData(self.password,data)
+                    self.clientSocket.send(ciphertext.encode())
+                    data=sys.stdin.readline()
+
+            try:
+                data=self.clientSocket.recv(BUFF_SIZE).decode().strip()
+                while data:
+                    self.recieveList.append(data)
+                    data=self.clientSocket.recv(BUFF_SIZE).decode().strip()
+            except socket.timeout:
+                self.clientSocket.close()
+
+
+            if len(self.recieveList) != 0:
+                print("Processing the received data.", file=sys.stderr)
+                try:
+                    for i in self.recieveList:
+                        if i:
+                            plaintext = decryptData(self.password,i)
+                            print(plaintext, file=sys.stdout, end='')
+                        else:
+                            pass
+                except:
+                    print("An error in decryption or MAC verification / decryption has occurred", file=sys.stderr)
+                print("Process complete.", file=sys.stderr)
+        except KeyboardInterrupt:
+            print("Quitting process due to keyboard interrupt.", file=sys.stderr)
+            sys.exit(0)
+        except socket.error:
+            print("Closing connection due to termination on remote side.", file=sys.stderr)
+            sys.exit(0)
 
 # -------------------------------------------------------------------------------------------------
 # COMMAND LINE ARGUMENTS
 # -------------------------------------------------------------------------------------------------
-
 
 def get_version():
     """Return version information."""
@@ -445,13 +738,15 @@ def get_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False,
-        usage="""%(prog)s [-Cnuv] [-e cmd] hostname port
-       %(prog)s [-Cnuv] [-e cmd] -l hostname port
+        usage="""%(prog)s [-Cnuv] [-e cmd] hostname port -k key
+       %(prog)s [-Cnuv] [-e cmd] -l hostname port -k key
        %(prog)s [-Cnuv] -L addr:port [hostname] port
        %(prog)s [-Cnuv] -R addr:port hostname port
        %(prog)s -V, --version
        %(prog)s -h, --help
        %(prog)s -s -sip [hostname] -sp start_port -ep end_port
+       %(prog)s -sf hostname port < send_file_name
+       %(prog)s -lf hostname port > receive_file_name
        """
         % ({"prog": NAME}),
         description="Netcat implementation in Python with connect, listen and forward mode.",
@@ -536,6 +831,27 @@ for ward all traffic from the specified value for -R/--remote.""",
         type=_args_check_port,
         help="Specify the ending port number",
     )
+    mode.add_argument(
+        "-sf",
+        "--send-file",
+        action="store_true",
+        help="Send file",
+    )
+
+    mode.add_argument(
+        "-lf",
+        "--listen-file",
+        action="store_true",
+        help="Receive file",
+    )
+
+    optional.add_argument(
+        '-k',
+        '--key', 
+        default='Network Security', 
+        type=str, 
+        help='A key value that will be used to encrypt data'
+    )
 
     optional.add_argument(
         "-e",
@@ -601,6 +917,23 @@ for ward all traffic from the specified value for -R/--remote.""",
                file=sys.stderr,
            )
            sys.exit(1)
+    if args.listen_file and (args.hostname is None or args.port is None):
+        parser.print_usage()
+        print(
+            "%s: error: the following arguments are required for listen file mode: hostname, port"
+            % (NAME),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.send_file and (args.hostname is None or args.port is None):
+        parser.print_usage()
+        print(
+            "%s: error: the following arguments are required for send file mode: hostname, port"
+            % (NAME),
+            file=sys.stderr,
+        )
+        sys.exit(1)
        
     # Required arguments
     if args.hostname is None and (not args.listen and args.local and args.scan is None):
@@ -655,6 +988,18 @@ def main():
         )
     elif args.scan:
         perform_port_scan(args.scan_ip, args.start_port, args.end_port)
+    elif args.send_file and args.hostname is not None and args.port is not None:
+        isServerFlag=True
+        ip=args.hostname
+        port=args.port
+        csobj=FileServer(ip, port, isServerFlag)
+        csobj.serverMode()
+    elif args.listen_file and args.hostname is not None and args.port is not None:
+        isServerFlag = False
+        ip=args.hostname
+        port=args.port
+        csobj = FileServer(ip, port, isServerFlag)
+        csobj.clientMode()
     else:
         run_client(
             args.hostname,
