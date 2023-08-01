@@ -80,25 +80,27 @@ def log(msg, level, verbose):
 
 
 # -------------------------------------------------------------------------------------------------
-# ENCRYPT DECRYPT FUNCTIONS -- HANXIAO
+# ENCRYPT DECRYPT FUNCTIONS
 # -------------------------------------------------------------------------------------------------
 def genKey(password,salt):
         return PBKDF2(password, salt, dkLen=32, count=1000)
-
-def encryptData(password,data):
-    nonce = get_random_bytes(16)
-    salt = get_random_bytes(32)
-    cipher = AES.new(genKey(password, salt), AES.MODE_GCM, nonce=nonce)
+        
+def encryptData(password, data):
+    nonce = get_random_bytes(13)
+    salt = get_random_bytes(16)
+    cipher = AES.new(genKey(password, salt), AES.MODE_CCM, nonce=nonce, mac_len=8)
+    cipher.update(salt)
     ciphered_data, digest = cipher.encrypt_and_digest(data.encode('utf-8'))
     return base64.b64encode(nonce + salt + ciphered_data + digest).decode('utf-8')
 
-def decryptData(password,data):
+def decryptData(password, data):
     data = base64.b64decode(data)
-    nonce = data[:16]
-    salt = data[16:48]
-    ciphered_data = data[48:-16]
-    digest = data[-16:]
-    cipher = AES.new(genKey(password, salt), AES.MODE_GCM, nonce=nonce)
+    nonce = data[:13]
+    salt = data[13:29]
+    ciphered_data = data[29:-8]
+    digest = data[-8:]
+    cipher = AES.new(genKey(password, salt), AES.MODE_CCM, nonce=nonce, mac_len=8)
+    cipher.update(salt)
     original_data = cipher.decrypt_and_verify(ciphered_data, digest).decode('utf-8')
     return original_data
 
@@ -317,36 +319,22 @@ def connect(s, addr, port, verbose=0):
 # SHARED SECRET
 # -------------------------------------------------------------------------------------------------
 def client_get_shared_secret(sock):
-    # set the first request according to our protocol
     request = b'Hello'
-    # send the request
     sock.sendall(request)
-    # read the server's response
     received = sock.recv(3072).strip()
-    # print what we have received from the server
-    # print('Received:\n{}'.format(received))
-    # check if the response is valid according to our protocol
     if received == b'Hey there!':
-        # set the next request accordingly
         request = b'Params?'
         sock.sendall(request)
     else:
-        # if we get here something is not right
         print('Bad response')
-        # close the connection and return
         sock.close()
         return None
-    # this means we are still in the game and the next server response must be the DH parameters
+    
     received = sock.recv(3072).strip()
-    # print('Received:\n{}'.format(received))
+
     dh_params = load_pem_parameters(received, default_backend())
-    # check if the params are valid DH params (do we get here if the response was not valid or
-    # do we get an error before getting here?)
     if isinstance(dh_params, dh.DHParameters):
-        # based on received parameters we generate a key pair
         client_keypair = dh_params.generate_private_key()
-        # create the next message according to the protocol, get the binary of the public key
-        # to send to the server
         request = b'Client public key:' + client_keypair.public_key().public_bytes(
         Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
         sock.sendall(request)
@@ -354,21 +342,14 @@ def client_get_shared_secret(sock):
         print('Bad response')
         sock.close()
         return None
-    # this means we are still in the game
+
     received = sock.recv(3072).strip()
-    # print('Received:\n{}'.format(received))
-    # check the format of the message (or rather the beginning)
     if bytearray(received)[0:18] == b'Server public key:':
-        # get the server's public key from the binary and its proper index to the end
         server_pubkey = load_pem_public_key(bytes(bytearray(received)[18:]), default_backend())
         if isinstance(server_pubkey, dh.DHPublicKey):
-            # calculate the shared secret
             shared_secret = client_keypair.exchange(server_pubkey)
-            # print the shared secret
-            # print('Shared Secret\n{}'.format(ba.hexlify(shared_secret))) # close the connection
             return shared_secret
 
-    # if we get here it means something went wrong
     print('Failed')
     sock.close()
     return None
@@ -381,9 +362,6 @@ def load_dh_params():
     are hard-coded into programs
     '''
     with open('./dh_2048_params.bin', 'rb') as f:
-        # the load_pem_parameters is part of serialization which reads binary 
-        # input and converts it to proper objects in this case it is
-        # DH parameters
         params = load_pem_parameters(f.read(), default_backend())
     print('Parameters have been read from file, Server is ready for requests ...')
     return params
@@ -395,11 +373,6 @@ def generate_dh_prvkey(params):
     return params.generate_private_key()
     
 def check_client_pubkey(pubkey):
-    '''
-    Check whether the client public key is a valid instance of DH
-    shouldn't we check whether the key is valid under the parameters
-    sent by the server?
-    '''
     if isinstance(pubkey, dh.DHPublicKey):
         return True
     else:
@@ -409,78 +382,42 @@ def  Dh_Handler(socket):
         '''
         This function handles the requests and sends proper responses
         '''
-        # we read the first message sent by the client up to 3072 bytes
-        # what if the message is longer?
-        # should we check the size of the message?
         data = socket.recv(3072).strip()
         params = load_dh_params()
 
-        # here we are inventing our own protocol so say the first message sent by the client
-        # must be the text Hello, this message will only be valid if we are in state 0, ready 
-        # and just received the first request       
+        
         if data == b'Hello':
-            # print(data)
-            # now let's say the proper response in our protocol to the client's Hello message
-            # is the text message Hey There!
             response = b'Hey there!'
-            # here we send this out to the client
             socket.sendall(response)
         else:
-            # we have received an invalid message since we can only expect a text Hello
-            # in state 0, anything else is invalid and we end the communication and return
             response = b'I do not understand you, hanging up'
             socket.sendall(response)
             return
         
-        # so far so good, if we get here it means we have received a proper Hello
-        # and have sent a proper Hey There!
-        # now is time to read the next client request   
         data = socket.recv(3072).strip()
-        # we define the request be the text Params? and if we are in initiated state
         if data == b'Params?':
-            # print(data)
             dh_params = params
-            # here we convert the parameter object to binary so we could send it over the network
             response = dh_params.parameter_bytes(Encoding.PEM, ParameterFormat.PKCS3)
             socket.sendall(response)
         else:
-            # if we get here then something was not right so we end the communication and return
             response = b'I do not understand you, hanging up'
             socket.sendall(response)
             return
 
-        # Ok we have come a long way, time to read the next client message
         data = socket.recv(3072).strip()
-        # now in our protocol we define that when the client wants to send the public key
-        # it would start the message with the text "Client public key:", we check if the message
-        # starts with that. We convert the received binary data to bytearray and take the first
-        # 18-byte slice of it which must be our expected text. Of-course we must be in state 2 
-        # (although we will not get here otherwise or would we?)
         if bytearray(data)[0:18] == b'Client public key:':
-            # now we convert the binary message to bytearray so we can choose the public key 
-            # part of it and use key serialization method to turn it into an object
             client_pubkey = load_pem_public_key(bytes(bytearray(data)[18:]), default_backend())
-            # now if the public key is loaded (we might not get to this point otherwise, 
-            # something for you to check!)
             if client_pubkey:
-                # client key is valid so we generate our own from the parameters
                 server_keypair = generate_dh_prvkey(params)
 
-                # we will send the public key to the client and we need to convert it to 
-                # binary to send over the network
                 response = b'Server public key:' + server_keypair.public_key().public_bytes(
                     Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
 
-                # then we will calculate the shared secret
                 shared_secret = server_keypair.exchange(client_pubkey)
                 
-                # print(data)
                 socket.sendall(response)
-                # we print the shared secret on the server and return
-                # print('Shared Secret\n{}'.format(ba.hexlify(shared_secret)))
                 return (shared_secret)
             else:
-                # if we get here the client key is not right
                 response = b'Invalid client public key, hanging up'
                 socket.sendall(response)
                 return 
@@ -956,8 +893,6 @@ def perform_port_scan(scan_ip, start_port, end_port):
             result = sock.connect_ex((scan_ip, port))
             if result == 0:
                 print(f"Port {port} is open")
-            else:
-                print(f"Port {port} is closed")
 
             sock.close()
         except socket.error:
